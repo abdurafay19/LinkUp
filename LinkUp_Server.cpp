@@ -144,10 +144,18 @@ void saveClientDB()
 //---------------------------------------------------------------------- 
 void handleClient(SOCKET clientSocket)
 {
+    sockaddr_in clientAddr;
+    int clientAddrLen = sizeof(clientAddr);
+    getpeername(clientSocket, (sockaddr*)&clientAddr, &clientAddrLen);
+
+    char clientIP[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
+    uint16_t clientPort = ntohs(clientAddr.sin_port);
+    string clientIPPort = string(clientIP) + ":" + to_string(clientPort);
+
     char buffer[4096];
     int bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
-    if (bytesReceived <= 0)
-    {
+    if (bytesReceived <= 0) {
         closesocket(clientSocket);
         return;
     }
@@ -155,19 +163,17 @@ void handleClient(SOCKET clientSocket)
     // Read request and split by '|'
     string request(buffer, bytesReceived);
     vector<string> parts = splitString(request, '|');
-    if (parts.size() < 2)
-    {
+    if (parts.size() < 2) {
         send(clientSocket, "ERROR|Invalid format", 20, 0);
         closesocket(clientSocket);
         return;
     }
 
     string code = parts[0];  // APP_CODE
-    string action = parts[1];  // REG, LOG, PULS, SRCH
+    string action = parts[1];  // REG, LOG, PULS, SRCH, DISC
 
     // Verify application code
-    if (code != APP_CODE)
-    {
+    if (code != APP_CODE) {
         send(clientSocket, "ERROR|Invalid application code", 29, 0);
         closesocket(clientSocket);
         return;
@@ -176,41 +182,25 @@ void handleClient(SOCKET clientSocket)
     // Determine origin username (always parts[2] for all actions)
     string originUser = (parts.size() >= 3 ? parts[2] : "");
 
-    // For PULS and SRCH, ensure originUser is already online
-    if (action == "PULS" || action == "SRCH")
-    {
-        auto itO = clientDB.find(originUser);
-        if (itO == clientDB.end() || itO->second.ip_port == "null")
-        {
-            send(clientSocket, "ERROR|User not online", 21, 0);
-            closesocket(clientSocket);
-            return;
-        }
-    }
-
     lock_guard<mutex> lock(dbMutex);
     string response;
 
-    if (action == "REG")
-    {
-        // Expect: CODE|REG|username|password|ip:port
-        if (parts.size() < 5)
-        {
+    if (action == "REG") {
+        // Expect: CODE|REG|username|password
+        if (parts.size() < 4) {
             response = "ERROR|Invalid format";
         }
         else {
             string username = parts[2];
             string password = parts[3];
-            string ip_port = parts[4];
-            if (clientDB.count(username))
-            {
+            if (clientDB.count(username)) {
                 response = "ERROR|Username exists";
             }
-            else
-            {
-                clientDB[username] =
-                {
-                    username, password, ip_port,
+            else {
+                clientDB[username] = {
+                    username,
+                    password,
+                    clientIPPort,  // Auto-detected IP:port
                     chrono::steady_clock::now()
                 };
                 saveClientDB();
@@ -218,41 +208,41 @@ void handleClient(SOCKET clientSocket)
             }
         }
     }
-    else if (action == "LOG")
-    {
-        // Expect: CODE|LOG|username|password|ip:port
-        if (parts.size() < 5)
-        {
+    else if (action == "LOG") {
+        // Expect: CODE|LOG|username|password
+        if (parts.size() < 4) {
             response = "ERROR|Invalid format";
         }
         else {
             string username = parts[2];
             string password = parts[3];
-            string ip_port = parts[4];
             auto it = clientDB.find(username);
-            if (it != clientDB.end() && it->second.password == password)
-            {
-                it->second.ip_port = ip_port;
+            if (it != clientDB.end() && it->second.password == password) {
+                // Update IP:port with current connection info
+                it->second.ip_port = clientIPPort;
                 it->second.lastHeartbeat = chrono::steady_clock::now();
                 saveClientDB();
                 response = "SUCCESS|Login successful";
             }
-            else
-            {
+            else {
                 response = "ERROR|Invalid credentials";
             }
         }
     }
-    else if (action == "PULS")
-    {
+    else if (action == "PULS") {
         // Expect: CODE|PULS|username
-        // originUser already validated as online
         auto it = clientDB.find(originUser);
-        it->second.lastHeartbeat = chrono::steady_clock::now();
-        response = "SUCCESS|Pulse received";
+        if (it == clientDB.end()) {
+            response = "ERROR|User not registered";
+        }
+        else {
+            // Update both heartbeat and connection info
+            it->second.ip_port = clientIPPort;
+            it->second.lastHeartbeat = chrono::steady_clock::now();
+            response = "SUCCESS|Pulse received";
+        }
     }
-    else if (action == "SRCH")
-    {
+    else if (action == "SRCH") {
         // Expect: CODE|SRCH|originUsername|targetUsername
         if (parts.size() < 4) {
             response = "ERROR|Invalid format";
@@ -260,46 +250,37 @@ void handleClient(SOCKET clientSocket)
         else {
             string target = parts[3];
             auto itT = clientDB.find(target);
-            if (itT != clientDB.end())
-            {
-                if (itT->second.ip_port != "null")
-                {
+            if (itT != clientDB.end()) {
+                if (itT->second.ip_port != "null") {
                     response = "SUCCESS|" + itT->second.ip_port;
                 }
-                else
-                {
+                else {
                     response = "ERROR|User offline";
                 }
             }
-            else
-            {
+            else {
                 response = "ERROR|User not found";
             }
         }
     }
-    else if (action == "DISC")
-    {
+    else if (action == "DISC") {
         // Expect: CODE|DISC|username
         auto it = clientDB.find(originUser);
-        if (it != clientDB.end())
-        {
+        if (it != clientDB.end()) {
             it->second.ip_port = "null";
             response = "SUCCESS|Disconnected successfully";
         }
-        else
-        {
+        else {
             response = "ERROR|User not found";
         }
     }
-    else
-    {
+    else {
         response = "ERROR|Invalid action";
     }
 
     send(clientSocket, response.c_str(), (int)response.size(), 0);
     closesocket(clientSocket);
 }
-
 
 //----------------------------------------------------------------------
 // Entry point: sets up Winsock, listens for incoming connections,
